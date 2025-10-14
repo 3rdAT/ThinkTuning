@@ -5,9 +5,6 @@ source .venv/bin/activate
 
 # HF and wandb credentials
 # HF and wandb credentials
-export HF_TOKEN=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
-export WANDB_API_KEY=167f77df3e2d14177e53333df1eb899324ea1450
-export WANDB_API_KEY=c09d92ce856d5de5fb37c7eb46706bff574d7b0e
 export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.6"
 export HOME="/scr/arrv"
 export HF_HOME="/scr/arrv/tmp"
