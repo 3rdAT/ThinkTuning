@@ -36,6 +36,16 @@ def default_compute_score(data_source, solution_str, ground_truth, extra_info=No
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
+    elif data_source == "gsm8k_thinking":
+        from . import math_verify_cognitive
+
+        res = math_verify_cognitive.compute_score(solution_str, ground_truth)
+        
+    elif data_source == "gsm8k_vijay":
+        from . import math_verify_vijay
+
+        res = math_verify_vijay.compute_score(solution_str, ground_truth)
+
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval"]:
         from . import math
 

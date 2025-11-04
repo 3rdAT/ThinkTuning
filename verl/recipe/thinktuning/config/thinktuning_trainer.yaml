@@ -7,6 +7,8 @@ data:
   reward_fn_key: data_source
   max_prompt_length: 512
   max_response_length: 512
+  max_prompt_length_teacher: 3072
+  max_response_length_teacher: 1024
   train_batch_size: 1024
   val_batch_size: null
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
@@ -225,8 +227,8 @@ actor2_rollout_ref:
     top_k: ${actor_rollout_ref.rollout.top_k} # 0 for hf rollout, -1 for vllm rollout
     top_p: ${actor_rollout_ref.rollout.top_p}
     use_fire_sampling: ${actor_rollout_ref.rollout.use_fire_sampling} # https://arxiv.org/abs/2410.21236
-    prompt_length: ${data.max_prompt_length}  # not use for opensource
-    response_length: ${data.max_response_length}
+    prompt_length: ${data.max_prompt_length_teacher}  # not use for opensource
+    response_length: ${data.max_response_length_teacher}
     # for vllm rollout
     dtype: ${actor_rollout_ref.rollout.dtype} # should align with FSDP
     gpu_memory_utilization: ${actor_rollout_ref.rollout.gpu_memory_utilization}

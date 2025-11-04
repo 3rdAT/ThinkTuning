@@ -65,6 +65,16 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
+from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+from tensordict import TensorDict
+import numpy as np
+import time
+import re
+import json
+import uuid
+from copy import deepcopy
+from collections import defaultdict
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -89,6 +99,59 @@ def get_sharding_strategy(device_mesh):
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy
+
+def has_eos_token(model_output):
+    try:
+    # Must occur exactly once and be at the end
+        token = "<|eot_id|>"
+        count = model_output.count(token)
+        return count == 1 and model_output.endswith(token)
+    except Exception:
+        return False
+
+def get_eligible_mask(total_indices, original_responses):
+    # This is a placeholder function. Replace with your actual eligibility logic.
+    # For example, you might want to check if the index is even or odd.
+    mask = []
+    for i in range(total_indices):
+        if has_eos_token(original_responses[i]):
+            mask.append(True)
+        else:
+            mask.append(False)
+        
+    return np.array(mask, dtype=bool)
+
+def get_uid_based_selected_indices(group_uids, eligibility_mask, selection_percentage):
+    uid_to_indices = defaultdict(list)
+
+    for idx, uid in enumerate(group_uids):
+        if eligibility_mask[idx]:
+            uid_to_indices[uid].append(idx)
+
+    selected_indices = []
+    for uid, indices in uid_to_indices.items():
+        k = max(1, int(len(indices) * selection_percentage))
+        selected = np.random.choice(indices, size=min(k, len(indices)), replace=False)
+        selected_indices.extend(selected)
+
+    return sorted(selected_indices)
+
+def filter_phrase(ele):
+    phrase = ele
+    if "<phrase>" in phrase and "</phrase>" in phrase:                  # turn1: ...... . The answer is $10.<eot_id> ### m1 ->
+        start = phrase.rindex("<phrase>") + len("<phrase>")
+        end = phrase.rindex("</phrase>")
+        return phrase[start:end].strip()
+    return ''
+
+def filter_reason(ele):
+    phrase = ele
+    if "<reason>" in phrase and "</reason>" in phrase:                  # turn1: ...... . The answer is $10.<eot_id> ### m1 ->
+        start = phrase.rindex("<reason>") + len("<reason>")
+        end = phrase.rindex("</reason>")
+        return phrase[start:end].strip()
+    return ''
+
 
 
 class ActorRolloutRefWorker(Worker):
@@ -482,6 +545,9 @@ class ActorRolloutRefWorker(Worker):
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
 
         use_remove_padding = self.config.model.get("use_remove_padding", False)
+
+        self.teacher_tokenizer = hf_tokenizer(self.config.model.path, trust_remote_code=True)
+
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
 
@@ -634,6 +700,215 @@ class ActorRolloutRefWorker(Worker):
 
         # clear kv cache
         get_torch_device().empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def guidance_sequences_recompute(self, prompts: DataProto):
+        # Support all hardwares
+
+        do_injection = False
+        prompts = prompts.to(torch.cuda.current_device())
+
+        non_tensor_batch = deepcopy(prompts.non_tensor_batch)
+        meta_info = deepcopy(prompts.meta_info)
+
+        student_tokenizer = self.tokenizer
+        teacher_tokenizer = self.teacher_tokenizer
+        #Decode it to strings
+        bz = prompts.batch.batch_size
+
+        total_indices = prompts.batch["input_ids"].shape[0]
+        uids = [str(uuid.uuid4()) for _ in range(total_indices)]
+        indices = list(range(total_indices))
+        idx2uid = dict(zip(indices, uids))
+        
+        teacher_responses = []
+        phrases = []
+        reasons = []
+
+        original_prompts = []
+        original_responses = []
+
+        selected_indices = []
+
+        for i in range(prompts.batch['prompts'].shape[0]):
+          # DataProtoItem
+            prompt_ids = prompts.batch["prompts"][i]
+            prompt_length = prompt_ids.shape[-1]
+
+            valid_prompt_length = prompts.batch["attention_mask"][i][:prompt_length].sum()
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = prompts.batch["responses"][i]
+            valid_response_length = prompts.batch["attention_mask"][i][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            prompt_str = student_tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
+            original_prompts.append(prompt_str)
+
+            response_str = student_tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+            original_responses.append(response_str)
+
+        prop_teacher_str = []
+        for i in range(prompts.batch['teacher_ids'].shape[0]):
+            teacher_ids = prompts.batch["teacher_ids"][i]
+            valid_teacher_length = prompts.batch["teacher_attention_mask"][i].sum()
+            valid_teacher_ids = teacher_ids[:valid_teacher_length]
+
+            teacher_str = student_tokenizer.decode(valid_teacher_ids, skip_special_tokens=False)
+
+            # Filter the phrases and reasons
+            phrase = filter_phrase(teacher_str)
+            reason = filter_reason(teacher_str)
+
+            phrases.append(phrase)
+            reasons.append(reason)
+
+            prop_teacher_str.append(teacher_str)
+
+            if has_eos_token(original_responses[i]) and teacher_str != "NoFeedback":
+                selected_indices.append(i)
+                teacher_responses.append(teacher_str)
+
+        promptys = []
+        uids_for_promptys = []
+        for i in range(prompts.batch['input_ids'].shape[0]):
+            if i in selected_indices:
+                new_prompt_injected = original_prompts[i] + original_responses[i][:-len(student_tokenizer.eos_token)] + '\n\n' + reasons[i] + '\n\n' + phrases[i] 
+                promptys.append(new_prompt_injected)
+                uids_for_promptys.append(uids[i])
+        
+        assert len(promptys) == len(selected_indices)
+
+        del prompts
+        def recompute_batch(prompts, responses, selected_indices):
+            new_batch = {}            
+            resp_len = 1024
+            prompt_len = 1024
+            #TODO: Use response_length from config directly instead of hardcoding
+            new_batch['input_ids'] = torch.zeros((len(prompts), prompt_len), dtype=torch.long)
+            new_batch['attention_mask'] = torch.zeros((len(prompts), prompt_len), dtype=torch.long)
+            new_batch['position_ids'] = torch.zeros((len(prompts), prompt_len), dtype=torch.long)
+            new_batch['responses'] = torch.zeros((len(prompts), resp_len), dtype=torch.long)
+            new_batch['teacher_mask'] = torch.zeros((len(prompts), resp_len), dtype=torch.long)
+
+            for i, (prompty, response) in enumerate(zip(prompts, responses)):
+                # 1. prompt -----------------------------------------------------------------
+                model_inputs = self.tokenizer(prompty, return_tensors="pt", add_special_tokens=False)
+                input_ids = model_inputs.pop("input_ids")
+                attention_mask = model_inputs.pop("attention_mask")
+
+                input_ids, attention_mask = verl_F.postprocess_data(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=prompt_len,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    left_pad=True,
+                    truncation='left',
+                )
+                position_ids = compute_position_id_with_mask(attention_mask)
+
+                # 2. response ---------------------------------------------------------------
+                if i in selected_indices:
+                    vanilla_outputs = student_tokenizer(response[:-len(student_tokenizer.eos_token)], return_tensors="pt", add_special_tokens=False) #Check if eos_id is included
+                    vanilla_response_ids = vanilla_outputs.pop("input_ids")
+                    vanilla_response_ids_teacher_mask = torch.ones(vanilla_response_ids.shape, dtype=torch.long) #Whole trajectory
+
+                    t_content = '\n\n'+reasons[i]+'\n\n'+phrases[i]+student_tokenizer.eos_token
+                    teacher_outputs = student_tokenizer(t_content, return_tensors="pt", add_special_tokens=False)
+                    teacher_output_ids = teacher_outputs.pop("input_ids")
+                    teacher_tokens_teacher_mask =  torch.ones(teacher_output_ids.shape, dtype=torch.long)
+
+                    response_ids = torch.cat([vanilla_response_ids, teacher_output_ids], dim=1)
+                    teacher_mask = torch.cat([vanilla_response_ids_teacher_mask, teacher_tokens_teacher_mask], dim=1)
+                else:
+                    model_outputs = student_tokenizer(response, return_tensors="pt", add_special_tokens=False)
+                    response_ids = model_outputs.pop("input_ids")
+                    teacher_mask = torch.zeros(response_ids.shape,dtype=torch.long)
+                    
+                if response_ids.shape[1] < resp_len:
+                    response_ids = pad_sequence_to_length(response_ids, resp_len, student_tokenizer.pad_token_id)
+                    teacher_mask = pad_sequence_to_length(teacher_mask, resp_len, 0) #Pad remaining as zero teacher mask
+
+                if response_ids.shape[1] > resp_len:
+                    response_ids = response_ids[: , : resp_len]
+                    teacher_mask = teacher_mask[:, : resp_len]
+
+                # 3. populate tensors -------------------------------------------------------
+                new_batch['input_ids'][i] = input_ids[0]
+                new_batch['attention_mask'][i] = attention_mask[0]
+                new_batch['position_ids'][i] = position_ids[0]
+                new_batch['responses'][i] = response_ids[0]
+                new_batch['teacher_mask'][i] = teacher_mask[0]
+
+            batch = TensorDict(
+                {
+                    "prompts": new_batch['input_ids'], # Return the actual prompt_ids and attention_mask so that, while computing log_probs it is useful.
+                    "responses": new_batch['responses'],
+                    "input_ids": new_batch['input_ids'],  # here input_ids become the whole sentences
+                    # 'old_log_probs': log_probs, # we will recompute old log prob with actor
+                    "attention_mask": new_batch['attention_mask'],
+                    "position_ids": new_batch['position_ids'],
+                    "teacher_mask": new_batch['teacher_mask']
+                },
+                batch_size=bz,
+            )
+                # del prompts
+            return batch
+        
+        batch = recompute_batch(original_prompts, original_responses, selected_indices)
+
+        batch = batch.to(torch.cuda.current_device())
+
+        position_ids = batch['position_ids']
+        attention_mask = batch['attention_mask']
+        prompt_ids = batch['prompts']
+        response_ids = batch["responses"]
+        teacher_mask = batch['teacher_mask']
+
+
+        seq = torch.cat([prompt_ids, response_ids], dim=-1)
+            
+        response_length = response_ids.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(response_ids.shape[0], 1)
+
+        # TODO(sgm): fix position_ids on right_pad
+        # prompt: left pad + response: right pad
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+        response_position_ids = position_ids[:, -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(response_id=response_ids, eos_token=student_tokenizer.eos_token_id, dtype=attention_mask.dtype) #When no eos token is present, the response_attention_mask is all ones. Causing improper log_probs to be calculated but padding is also eosid, in worst case there is no padding and no eos token.
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        # all the tp ranks should contain the same data here. data in all ranks are valid
+        batch = TensorDict(
+            {
+                "prompts": prompt_ids, # Return the actual prompt_ids and attention_mask so that, while computing log_probs it is useful.
+                "responses": response_ids,
+                "input_ids": seq,  # here input_ids become the whole sentences
+                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "teacher_mask": teacher_mask,
+            },
+            batch_size=bz,
+        )
+
+        # print(f"The batch is: {batch}")
+        # torch.save(batch, 'tensor_dict_debug.pt')
+        # print(f"The tensor_dict_debug.pt file has been saved")
+        # free vllm cache engine
+        output = DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info={},
+        )
+        output = output.to("cpu")
+
+        # clear kv cache
+        torch.cuda.empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -1158,6 +1433,8 @@ class Actor2RolloutRefWorker(Worker):
 
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
 
+        self.student_tokenizer = hf_tokenizer(self.config.model.path, trust_remote_code=True)
+
         use_remove_padding = self.config.model.get("use_remove_padding", False)
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
@@ -1287,21 +1564,131 @@ class Actor2RolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
+    
+        #=================================== Start of Custom Function for guidance eligibility ===================================
+        def format_reward_opinion(ele):
+            try:
+                # Check if the format matches the expected pattern:
+                # <opinion> (0 or 1) </opinion> followed by
+                # <think> content </think> followed by <answer> content </answer>
+                regex = (
+                    r"^<opinion>\s*(incorrect|correct)\s*<\/opinion>\n*"
+                    r"<reason>\s*([^<]*(?:<(?!/?reason>)[^<]*)*)\s*<\/reason>\n*"
+                    rf"<phrase>\s*([\s\S]*?)\s*<\/phrase>{self.tokenizer.eos_token}$"
+                )
+                match = re.search(regex, ele, re.DOTALL)
+
+                if match is not None and len(match.groups()) == 3:  # Now we expect 3 capturing groups
+                    return True
+                return False
+            except Exception:
+                return False
+        #=================================== End of Custom Function for guidance eligibility ===================================
         # Support all hardwares
         prompts = prompts.to(get_torch_device().current_device())
+        non_tensor_batch = deepcopy(prompts.non_tensor_batch)
 
+        meta_info = deepcopy(prompts.meta_info)
+
+        prompts_actual = [item['prompt_raw'] for item in non_tensor_batch['extra_info']]
+        system_prompts = [item['system_prompt_few_shot_array'] for item in non_tensor_batch['extra_info']] #ASH-EDITS TODO: Make sure to get the system prompts from the extra_info
+        
+        total_indices = prompts.batch["input_ids"].shape[0]
+        uids = [str(uuid.uuid4()) for _ in range(total_indices)]
+        indices = list(range(total_indices))
+        idx2uid = dict(zip(indices, uids))
+
+        group_uids = [hash(prompts_actual[i].strip()) for i in range(total_indices)]
+
+
+        #========== Tokenizer Initialization ==============
+        teacher_tokenizer = self.tokenizer
+        student_tokenizer = self.student_tokenizer
+
+        #Seed initialization for selection
+        np.random.seed(int(time.time()))
+
+        selection_percentage = self.selection_pct
+
+        original_responses = []
+
+        for i in range(prompts.batch['prompts'].shape[0]):
+          # DataProtoItem
+            prompt_ids = prompts.batch["prompts"][i]
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = prompts.batch["responses"][i]
+            valid_response_length = prompts.batch["attention_mask"][i][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+            response_str = student_tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+            original_responses.append(response_str)
+
+        eligibility_mask = get_eligible_mask(total_indices, original_responses)
+        selected_indices = get_uid_based_selected_indices(
+                group_uids, eligibility_mask, selection_percentage
+            )   
+        print(f"The no of injected_indices/total_indices is: {len(selected_indices)}/{total_indices}")
+
+        promptys = []
+        uids_for_promptys = []
+
+        for i in range(prompts.batch['prompts'].shape[0]):
+            if i in selected_indices:
+                # extract raw prompt
+                user_prompt = f'''Question:\n{prompts_actual[i]} Let's think step by step and provide your final answer inside \\boxed{{}} notation.\n\nResponse:\n{original_responses[i]}'''
+
+                user_role_list = {
+                                "role":"user",
+                                "content":f"""{user_prompt}"""
+                            }
+                template = deepcopy(system_prompts[i])
+                template.append(user_role_list)
+
+                new_prompt_str = teacher_tokenizer.apply_chat_template(template, tokenize=False, add_generation_prompt=True)
+
+                promptys.append(new_prompt_str)
+                uids_for_promptys.append(uids[i])
+
+        print(f"The length of the promptys is: {len(promptys)}")
+
+        inference_batch = DataProto(batch = TensorDict({}, batch_size=[len(promptys)]), meta_info={})
+
+        inference_batch.batch['input_ids2'] = torch.zeros((len(promptys), 1024*3), dtype=torch.long)
+        inference_batch.batch['attention_mask2'] = torch.zeros((len(promptys), 1024*3), dtype=torch.long)
+        inference_batch.batch["position_ids2"] = torch.zeros((len(promptys), 1024*3), dtype=torch.long)
+
+        for i,prompty in enumerate(promptys):
+            input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompty,
+                                                                        tokenizer=teacher_tokenizer,
+                                                                        max_length=1024*3,
+                                                                        pad_token_id=teacher_tokenizer.pad_token_id,
+                                                                        left_pad=True,
+                                                                        truncation='left')
+            
+            inference_batch.batch['input_ids2'][i] = input_ids.squeeze(0)
+            inference_batch.batch['attention_mask2'][i] = attention_mask.squeeze(0)
+            inference_batch.batch['position_ids2'][i] = compute_position_id_with_mask(
+                    attention_mask.squeeze(0)
+                )
+
+        inference_batch.non_tensor_batch["uid_teacher_gen"] = np.array(uids_for_promptys, dtype=object)
+        batch = deepcopy(prompts.batch)
+        del prompts
         assert self._is_rollout
-
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
             "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
-        prompts.meta_info.update(meta_info)
+        inference_batch.meta_info.update(meta_info)
+
+        print(f"The size of the inference_batch is: {inference_batch.batch['input_ids2'].shape}")
+        print(f"The size of the inference_batch non_tensor_batch are: {inference_batch.non_tensor_batch['uid_teacher_gen'].shape}")
+
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            inference_batch = self.rollout_sharding_manager.preprocess_data(inference_batch)
+            
+            output = self.rollout.generate_sequences2(prompts=inference_batch)
 
             log_gpu_memory_usage("After rollout generation", logger=logger)
 
@@ -1309,6 +1696,68 @@ class Actor2RolloutRefWorker(Worker):
 
         output = output.to("cpu")
 
+        returned_uids = list(output.non_tensor_batch["uid_teacher_gen"])
+        #Decode all generations in the returned order
+        teacher_strs = []
+        for i in range(len(promptys)):
+            prompt_ids = output.batch["prompts2"][i]
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = output.batch["responses2"][i]
+            valid_response_length = output.batch["attention_mask2"][i][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+            teacher_response_str = teacher_tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+
+            teacher_strs.append(teacher_response_str)
+        
+        uid2str =  dict(zip(returned_uids, teacher_strs))
+
+        print(f"The selected indices are : {selected_indices}")
+
+        new_batch = {}
+
+        new_batch['teacher_ids'] = torch.zeros((batch['prompts'].shape[0], 512), dtype=torch.long)
+        new_batch['teacher_attention_mask'] = torch.zeros((batch['prompts'].shape[0], 512), dtype=torch.long)
+
+        # last_teacher_response = None
+        for i in range(batch['prompts'].shape[0]):
+            if i in selected_indices:
+                s_uid = idx2uid[i]
+                mapped_teacher_response = uid2str[s_uid]
+                if format_reward_opinion(mapped_teacher_response):
+                    teacher_response_str = mapped_teacher_response
+                else:
+                    teacher_response_str = "NoFeedback"
+            else:
+                teacher_response_str = "NoFeedback"
+
+
+            teacher_model_outputs = student_tokenizer(teacher_response_str, return_tensors="pt", add_special_tokens=False)
+            teacher_tokens =  teacher_model_outputs.pop("input_ids")
+            teacher_attention_mask = teacher_model_outputs.pop("attention_mask")
+
+            if teacher_tokens.shape[1] < 512:
+                teacher_tokens = pad_sequence_to_length(teacher_tokens, 512, student_tokenizer.pad_token_id)
+                teacher_attention_mask = pad_sequence_to_length(teacher_attention_mask, 512, 0)
+            
+            elif teacher_tokens.shape[1] > 512:
+                teacher_tokens = teacher_tokens[: , : 512]
+                teacher_attention_mask = teacher_attention_mask[: , : 512]
+
+            new_batch['teacher_ids'][i] = teacher_tokens[0]
+            new_batch['teacher_attention_mask'][i] = teacher_attention_mask[0]
+
+        tbatch = TensorDict(
+            {
+                "teacher_ids": new_batch['teacher_ids'],
+                "teacher_attention_mask": new_batch['teacher_attention_mask'],
+            },
+            batch_size=new_batch['teacher_ids'].shape[0],
+        )
+
+        output = DataProto(
+            batch=tbatch,
+        )
+        output = output.to("cpu")   
         # clear kv cache
         get_torch_device().empty_cache()
         return output
@@ -1443,6 +1892,12 @@ class Actor2RolloutRefWorker(Worker):
 
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
+
+    @register(dispatch_mode=Dispatch.ALL_TO_ALL)
+    def set_selection_pct(self, value: float):
+        print(f"Setting selection_pct to {value}")
+        self.selection_pct = float(value)
+
 
 
 

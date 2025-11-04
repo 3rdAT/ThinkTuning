@@ -234,6 +234,8 @@ class vLLMRollout(BaseRollout):
 
         batch_size = idx.size(0)
 
+        print(f"The keys in of student model prompts.non_tensor_batch are: {prompts.non_tensor_batch.keys()}")
+    
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
             non_tensor_batch["raw_prompt_ids"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
@@ -359,6 +361,168 @@ class vLLMRollout(BaseRollout):
             and self.config.free_cache_engine
         ):
             self.inference_engine.free_cache_engine()
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
+    @torch.no_grad()
+    def generate_sequences2(self, prompts: DataProto, **kwargs) -> DataProto:
+        # rebuild vllm cache engine
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+        ):
+            self.inference_engine.init_cache_engine()
+
+        idx = prompts.batch["input_ids2"]  # (bs, prompt_length)
+
+        # left-padded attention_mask
+        attention_mask = prompts.batch["attention_mask2"]
+        position_ids = prompts.batch["position_ids2"]
+
+        # used to construct attention_mask
+        eos_token_id = prompts.meta_info["eos_token_id"]
+
+        batch_size = idx.size(0)
+
+        # print(f"The batch size is: {batch_size}")
+        # print(f"The size in non_tensor_batch are: {prompts.non_tensor_batch['uid_teacher_gen'].shape}")
+        # raise RuntimeError("Stop here for debugging")
+
+        non_tensor_batch = prompts.non_tensor_batch
+        if "raw_prompt_ids2" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids2"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+
+        if batch_size != len(non_tensor_batch["raw_prompt_ids2"]):
+            raise RuntimeError("vllm sharding manager is not work properly.")
+
+        if "multi_modal_data" in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids2"), non_tensor_batch.pop("multi_modal_data")):
+                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+        else:
+            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids2")]
+
+        # ensure the type of `prompt_token_ids` passed to vllm is list[int]
+        # https://github.com/volcengine/verl/pull/772
+        for input_data in vllm_inputs:
+            if isinstance(input_data["prompt_token_ids"], np.ndarray):
+                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
+            elif not isinstance(input_data["prompt_token_ids"], list):
+                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+
+        do_sample = False
+        is_validate = False
+        if not do_sample:
+            kwargs = {
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,  # if greedy, only 1 response
+            }
+        elif is_validate:
+            # TODO: try **
+            kwargs = {
+                "top_k": self.config.val_kwargs.top_k,
+                "top_p": self.config.val_kwargs.top_p,
+                "temperature": self.config.val_kwargs.temperature,
+                "n": 1,  # if validate, already repeat in ray_trainer
+            }
+
+        lora_requests = None
+        if self.lora_kwargs:
+            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
+            if len(lora_int_ids) > 0:
+                lora_int_id=lora_int_ids[0]
+                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}",lora_int_id=lora_int_id,lora_path="/simon-stub-path")] * batch_size
+
+        # users can customize different sampling_params at different run
+        with self.update_sampling_params(**kwargs):
+            outputs = self.inference_engine.generate(
+                prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
+                lora_request=lora_requests,
+                use_tqdm=False,
+            )
+
+            # TODO(sgm): disable logprob when recompute_log_prob is enable
+            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+
+            response = []
+            rollout_log_probs = []
+            for output in outputs:
+                for sample_id in range(len(output.outputs)):
+                    response_ids = output.outputs[sample_id].token_ids
+                    response.append(response_ids)
+                    curr_log_prob = []
+                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                        curr_log_prob.append(logprob[response_ids[i]].logprob)
+                    rollout_log_probs.append(curr_log_prob)
+
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
+            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+            rollout_log_probs = rollout_log_probs.to(torch.float32)
+
+            if self.sampling_params.n > 1 and do_sample:
+                idx = _repeat_interleave(idx, self.sampling_params.n)
+                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
+                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
+                batch_size = batch_size * self.sampling_params.n
+                # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
+                if "tools_kwargs" in non_tensor_batch.keys():
+                    non_tensor_batch["tools_kwargs"] = _repeat_interleave(non_tensor_batch["tools_kwargs"], self.sampling_params.n)
+
+            seq = torch.cat([idx, response], dim=-1)
+
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+
+        # TODO(sgm): fix position_ids on right_pad
+        # prompt: left pad + response: right pad
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+        response_position_ids = position_ids[..., -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        # all the tp ranks should contain the same data here. data in all ranks are valid
+        batch = TensorDict(
+            {
+                "prompts2": idx,
+                "responses2": response,
+                "input_ids2": seq,  # here input_ids become the whole sentences
+                'rollout_log_probs2': rollout_log_probs, # we will recompute old log prob with actor
+                "attention_mask2": attention_mask,
+                "position_ids2": position_ids,
+            },
+            batch_size=batch_size,
+        )
+
+        # free vllm cache engine
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+        ):
+            self.inference_engine.free_cache_engine()
+
+        # print(f"The batch keys are: {batch.keys()}")
+        # print(f"The batch size is: {batch.batch_size}")
+        # print(f"The non_tensor_batch uid size is: {non_tensor_batch['uid_teacher_gen'].shape}")
+        # raise RuntimeError("Stop here for debugging")
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

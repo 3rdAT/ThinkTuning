@@ -457,11 +457,12 @@ def compute_policy_loss(
     log_prob,
     advantages,
     response_mask,
+    teacher_mask=None,
     cliprange=None,
     cliprange_low=None,
     cliprange_high=None,
     clip_ratio_c=3.0,
-    loss_agg_mode: str = "token-mean",
+    loss_agg_mode="token-mean",
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -493,27 +494,84 @@ def compute_policy_loss(
     """
     assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
 
+    # AAS Coefficient
+    def advantage_aware_shaping(advantages, gamma_min, gamma_max, A_min, A_max):
+        factor = (A_max -  advantages) / (A_max - A_min)
+        gamma = gamma_min + (gamma_max - gamma_min) * factor
+        return torch.clamp(gamma, gamma_min, gamma_max)
+
+    if teacher_mask is not None:
+        assert teacher_mask.shape == response_mask.shape
+
+    adv_aware_gamma = advantage_aware_shaping(advantages, 0.001, -0.001, -4.0, 4.0)
     negative_approx_kl = log_prob - old_log_prob
-    ratio = torch.exp(negative_approx_kl)
+
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    pg_losses1 = -advantages * ratio
-    if cliprange_low is None:
-        cliprange_low = cliprange
-    if cliprange_high is None:
-        cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    ratio = torch.exp(negative_approx_kl)
 
-    pg_losses3 = -advantages * clip_ratio_c
-    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+    
+    if teacher_mask is not None:
+        teacher_ratio_shaped_pre = torch.exp(log_prob)
 
-    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        # # ------- Variation 1 -------
+        denominator = teacher_ratio_shaped_pre.detach() + adv_aware_gamma
+        denominator = torch.where(denominator<0, teacher_ratio_shaped_pre.detach()/(1.0001), denominator)
+        denominator = torch.where(denominator>1, teacher_ratio_shaped_pre.detach()/(0.9999), denominator)
+        # # ------- Variation 1 -------
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+        # ------- Variation 2 -------
+        # denominator = teacher_ratio_shaped_pre + constant_gamma
+        # ------- Variation 2 -------
+
+        teacher_ratio_shaped = teacher_ratio_shaped_pre/denominator
+
+        adv_mask = (advantages < 0) & (teacher_ratio_shaped_pre < 0.01)
+
+        #Normal ratio_part
+        pg_losses1 = -advantages * ratio
+        if cliprange_low is None:
+            cliprange_low = cliprange
+        if cliprange_high is None:
+            cliprange_high = cliprange
+        pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+        clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+        pg_losses3 = -advantages * clip_ratio_c
+        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+        pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+        #Shaped ratio part
+        pg1_losses = -advantages * teacher_ratio_shaped
+
+        #Interpolating:
+        prefix_mask = teacher_mask.float() * (~adv_mask).float()
+        
+        final_pg_losses = pg1_losses * prefix_mask + pg_losses * (1 - prefix_mask)
+
+        pg_loss = agg_loss(loss_mat=final_pg_losses , loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    else:
+        pg_losses1 = -advantages * ratio
+        if cliprange_low is None:
+            cliprange_low = cliprange
+        if cliprange_high is None:
+            cliprange_high = cliprange
+        pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+        clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+        pg_losses3 = -advantages * clip_ratio_c
+        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+        pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+
+        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+        pg_loss = agg_loss(loss_mat=clip_pg_losses1, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, ratio
 
 
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):

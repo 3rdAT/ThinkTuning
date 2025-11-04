@@ -19,11 +19,11 @@ import hydra
 import ray
 from typing import List
 
-from recipe.multitask.multitask_ray_trainer import RayPPOTrainer
+from recipe.thinktuning.thinktuning_ray_trainer import RayPPOTrainer, RoleLayoutConfig, RoleLayoutConfigItem
 from verl.trainer.ppo.reward import load_reward_manager
 
 
-@hydra.main(config_path="config", config_name="multitask_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="thinktuning_trainer", version_base=None)
 def main(config):
     run_ppo(config)
 
@@ -79,7 +79,7 @@ class TaskRunner:
         if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
             assert config.critic.strategy in ["fsdp", "fsdp2"]
             from verl.single_controller.ray import RayWorkerGroup
-            from recipe.multitask.fsdp_workers import ActorRolloutRefWorker, Actor2RolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+            from recipe.thinktuning.fsdp_workers import ActorRolloutRefWorker, Actor2RolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
             actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
@@ -95,7 +95,7 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from recipe.multitask.multitask_ray_trainer import ResourcePoolManager, Role
+        from recipe.thinktuning.thinktuning_ray_trainer import Role, ColocateResourcePoolManager
 
         # role_worker_mapping = {
         #     Role.ActorRollout: ray.remote(actor_rollout_cls),
@@ -152,15 +152,20 @@ class TaskRunner:
 
         # use reference model
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
-            mapping[Role.RefPolicy] = global_pool_id
+            role_config_list.append(RoleLayoutConfigItem(
+                Role.RefPolicy, ray.remote(ActorRolloutRefWorker),
+                global_pool_id, global_group_id,
+            ))
 
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+        resource_pool_manager = ColocateResourcePoolManager(
+            resource_pool_spec=resource_pool_spec, 
+            mapping={item.role: item.resource_pool_name for item in role_config_list}
+        )
+        role_layout_config = RoleLayoutConfig(role_config_list, config=config)
 
-        from verl.utils.dataset.rl_dataset import collate_fn
-
+        from recipe.thinktuning.rl_dataset import collate_fn
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
@@ -168,7 +173,7 @@ class TaskRunner:
             config=config,
             tokenizer=tokenizer,
             processor=processor,
-            role_worker_mapping=role_worker_mapping,
+            role_layout_config=role_layout_config,
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
@@ -196,7 +201,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor):
     """
     from torch.utils.data import Dataset
 
-    from verl.utils.dataset.rl_dataset import RLHFDataset
+    from recipe.thinktuning.rl_dataset import RLHFDataset
 
     if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
         from verl.utils.import_utils import load_extern_type

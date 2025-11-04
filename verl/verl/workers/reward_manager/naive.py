@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from collections import defaultdict
-
+# INSERT_YOUR_CODE
+import json
+import os
 import torch
 
 from verl import DataProto
@@ -43,6 +45,8 @@ class NaiveRewardManager:
         reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
+
+        logs = []
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -85,6 +89,15 @@ class NaiveRewardManager:
 
             reward_tensor[i, valid_response_length - 1] = reward
 
+            log = {
+                "prompt": prompt_str,
+                "response": response_str,
+                "ground_truth": ground_truth,
+                "score": score,
+            }
+
+            logs.append(log)
+
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
 
@@ -98,6 +111,18 @@ class NaiveRewardManager:
                         print(f"[{key}]", value)
                 else:
                     print("[score]", score)
+
+
+        # Check if self.log_save_path attribute exists and is not None
+        log_save_path = None #[Optional] If you want to save the logs, you can set this to the path to save the logs
+        if log_save_path is not None:
+            # Make sure the parent directory exists
+            os.makedirs(os.path.dirname(log_save_path), exist_ok=True)
+            try:
+                with open(log_save_path, "w", encoding="utf-8") as f:
+                    json.dump(logs, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"Failed to save logs to {log_save_path}: {e}")
 
         if return_dict:
             return {

@@ -288,3 +288,5 @@ slurm-*.out
 checkpoints/
 GEMINI.md
 vllm/
+
+data/gsm8k_vijay/

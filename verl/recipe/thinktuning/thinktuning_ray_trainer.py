@@ -27,7 +27,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Dict, Optional, Type, Any
+from typing import Dict, Optional, Type, Any, Set, List
 
 import numpy as np
 import ray
@@ -37,6 +37,7 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -60,6 +61,8 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
+
+from verl.utils.teaching_schedulers import build_scheduler
 
 WorkerType = Type[Worker]
 
@@ -88,6 +91,48 @@ class RoleLayoutConfigItem:
     role_remote_worker_cls: Any
     resource_pool_name: str
     group_name: str
+
+class RoleLayoutConfig:
+    def __init__(self, roles: List[RoleLayoutConfigItem], config) -> None:
+        self.config = config
+        self.role_map = {role_item.role: role_item for role_item in roles}
+        self.resource_pools: Set[str] = set([role.resource_pool_name for role in roles])
+        self.groups: Set[str] = set([role.group_name for role in roles])
+        print(f"{self.resource_pools=} \n {self.groups=}")
+        print("\n".join([f"{item.role}  |  {item.group_name}  |  {item.resource_pool_name}" for item in roles]))
+        self._validate()
+
+    def _validate(self):
+        """
+        Validates the integrity and consistency of the layout configuration.
+        
+        It primarily ensures that all roles within a single process group are
+        mapped to the exact same resource pool.
+        """
+        # TODO: Validate that all required roles from the main config are present in the layout.
+
+        for group in self.groups:
+            # Get all resource pool names associated with this group
+            resource_pool = [v.resource_pool_name for v in self.role_map.values() if v.group_name == group]
+            assert all(pool == resource_pool[0] for pool in resource_pool)
+
+        print("RoleLayoutConfig validation passed successfully.")
+
+    def __getitem__(self, role: Role) -> RoleLayoutConfigItem:
+        return self.role_map[role]
+
+class ColocateResourcePoolManager(ResourcePoolManager):
+
+    def create_resource_pool(self, pool_map: Dict[str, Set]):
+        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+            assert resource_pool_name in pool_map.keys()
+            max_colocate_count = len(pool_map[resource_pool_name])
+            resource_pool = RayResourcePool(process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=max_colocate_count, name_prefix=resource_pool_name)
+            self.resource_pool_dict[resource_pool_name] = resource_pool
+
+        self._check_resource_available()
+
+
 
 
 class AdvantageEstimator(str, Enum):
@@ -367,7 +412,7 @@ class RayPPOTrainer:
         self,
         config,
         tokenizer,
-        role_worker_mapping: dict[Role, WorkerType],
+        role_layout_config: RoleLayoutConfig,
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
         processor=None,
@@ -391,12 +436,13 @@ class RayPPOTrainer:
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
         if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
+            assert Role.ActorRollout in role_layout_config.role_map.keys(), f"{role_layout_config.role_map=}"
 
-        self.role_worker_mapping = role_worker_mapping
+
+        self.role_layout_config = role_layout_config
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = Role.RefPolicy in role_worker_mapping
-        self.use_rm = Role.RewardModel in role_worker_mapping
+        self.use_reference_policy = Role.RefPolicy in role_layout_config.role_map.keys()
+        self.use_rm = Role.RewardModel in role_layout_config.role_map.keys()
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
@@ -423,6 +469,9 @@ class RayPPOTrainer:
             self.use_critic = False
         else:
             raise NotImplementedError
+
+        self.sel_pct_sched = build_scheduler(self.config.actor2_rollout_ref.teaching_scheduler)
+        self.selection_pct = self.sel_pct_sched() 
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -781,65 +830,70 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
-        self.resource_pool_manager.create_resource_pool()
 
-        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        pool_2_group = {pool: set() for pool in self.role_layout_config.resource_pools}
+        for item in self.role_layout_config.role_map.values():
+            pool_2_group[item.resource_pool_name].add(item.group_name)
 
-        # create actor and rollout
-        if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role="actor_rollout",
-            )
-            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+        self.resource_pool_manager.create_resource_pool(pool_map=pool_2_group)
 
-            #Initialize the second actor as well
-
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor2Rollout)
-            actor2_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.Actor2Rollout],
-                config=self.config.actor2_rollout_ref,
-                role="actor2_rollout",
-            )
-            self.resource_pool_to_cls[resource_pool]["actor2_rollout"] = actor2_rollout_cls
-        else:
-            raise NotImplementedError
-
-        # create critic
-        if self.use_critic:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
-            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
-
-        # create reference policy if needed
-        if self.use_reference_policy:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-            ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy], config=self.config.actor_rollout_ref, role="ref")
-            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
-
-        # create a reward model if reward_fn is None
-        if self.use_rm:
-            # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
-
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
         all_wg = {}
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.trainer, "profile_steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.trainer, "profile_steps")
+            assert OmegaConf.select(self.config.trainer, "worker_nsight_options") is not None, (
+                "worker_nsight_options must be set when profile_steps is set"
+            )
+            wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                OmegaConf.select(self.config.trainer, "worker_nsight_options")
+            )
 
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, device_name=self.device_name, **wg_kwargs)
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+        role_2_name: Dict[Role, str] = {
+            Role.ActorRollout: "actor_rollout",
+            Role.Critic: "critic",
+            Role.RefPolicy: "ref",
+            Role.RewardModel: "rm",
+            Role.Actor2Rollout: "actor2_rollout",
+        }
+        role_2_config: Dict[Role, Any] = {
+            Role.ActorRollout: self.config.actor_rollout_ref,
+            Role.Critic: self.config.critic,
+            Role.RefPolicy: self.config.actor_rollout_ref,
+            Role.RewardModel: self.config.reward_model,
+            Role.Actor2Rollout: self.config.actor2_rollout_ref,
+        }
+        no_role_kwargs = [Role.Critic, Role.RewardModel]
+
+        for work_group_id in self.role_layout_config.groups:
+            roles: List[Role] = [item.role for item in self.role_layout_config.role_map.values() 
+                     if item.group_name == work_group_id]
+
+            group_class_dict: Dict[str, RayClassWithInitArgs] = {
+                role_2_name[role]: (
+                    RayClassWithInitArgs(
+                        cls=self.role_layout_config[role].role_remote_worker_cls,
+                        config=role_2_config[role],
+                    )
+                ) if role in no_role_kwargs else (
+                    RayClassWithInitArgs(
+                        cls=self.role_layout_config[role].role_remote_worker_cls,
+                        config=role_2_config[role],
+                        role=role_2_name[role],
+                    )
+                )
+                for role in roles
+            }
+
+            worker_dict_cls = create_colocated_worker_cls(class_dict=group_class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=self.resource_pool_manager.get_resource_pool(roles[0]),
+                ray_cls_with_init=worker_dict_cls,
+                device_name=self.device_name,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=group_class_dict.keys())
             all_wg.update(spawn_wg)
 
         if self.use_critic:
@@ -861,7 +915,7 @@ class RayPPOTrainer:
         self.actor2_rollout_wg = all_wg["actor2_rollout"]
         self.actor2_rollout_wg.init_model()
 
-        # create async rollout manager and request scheduler
+        # create async rollout manager and request scheduler TODO: Need to handle this gracefully for True case.
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
             self.async_rollout_mode = True
@@ -869,6 +923,8 @@ class RayPPOTrainer:
                 config=self.config.actor_rollout_ref,
                 worker_group=self.actor_rollout_wg,
             )
+
+
 #TODO: Add a function to save the checkpoint for the second actor
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -992,6 +1048,7 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
+        print(f"val_before_train: {self.config.trainer.get('val_before_train', "Could not find")}")
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
@@ -1006,6 +1063,7 @@ class RayPPOTrainer:
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+        teacher_needed = True
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1014,17 +1072,19 @@ class RayPPOTrainer:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                batch_keys_to_pop1 = ["input_ids", "attention_mask", "position_ids"]
+                non_tensor_batch_keys_to_pop1 = ["raw_prompt_ids"]
                 if "multi_modal_data" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
+                    non_tensor_batch_keys_to_pop1.append("multi_modal_data")
                 if "raw_prompt" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
+                    non_tensor_batch_keys_to_pop1.append("raw_prompt")
                 if "tools_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                    non_tensor_batch_keys_to_pop1.append("tools_kwargs")
+
+
                 gen_batch = batch.pop(
-                    batch_keys=batch_keys_to_pop,
-                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                    batch_keys=batch_keys_to_pop1,
+                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop1,
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -1039,27 +1099,42 @@ class RayPPOTrainer:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with _timer("gen_max", timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del gen_baseline_batch, gen_baseline_output
-
                     batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+
+                    #=================================== Start of Teacher Guidance Control Logic ===================================
+                    if self.selection_pct <= self.config.actor2_rollout_ref.teaching_scheduler.eps+0.01 and self.actor2_rollout_wg and teacher_needed:
+                        print("Shifting to GRPO mode")
+                        teacher_needed = False
+                        logger.log({"training/teacher_disabled_at": self.global_steps}, step=self.global_steps)
+                        refs = [
+                            w.actor2_rollout_set_selection_pct.remote(self.selection_pct)#ref_set_selection_pct
+                            for w in self.actor2_rollout_wg.workers
+                        ]
+                        ray.get(refs)
+                    #=================================== End of Teacher Guidance Control Logic ===================================
+
+                    #=================================== Start of Custom Injection Logic from the teacher model ===================================
+                    if teacher_needed:
+                        refs = [
+                            w.actor2_rollout_set_selection_pct.remote(self.selection_pct)#ref_set_selection_pct
+                            for w in self.actor2_rollout_wg.workers
+                        ]
+                        ray.get(refs)
+
+                        with _timer("gen_teacher_guidance", timing_raw):
+                            batch_teacher = self.actor2_rollout_wg.generate_sequences(batch) 
+                        batch = batch.union(batch_teacher)
+
+                        with _timer("gen_student_injected_response", timing_raw):
+                            batch = self.actor_rollout_wg.guidance_sequences_recompute(batch) 
+
+                        self.selection_pct = self.sel_pct_sched() #Update the selection percentage
+                    #=================================== End of Custom Injection Logic from the teacher model ===================================
+                    
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -1200,6 +1275,7 @@ class RayPPOTrainer:
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
                             )
+                        # raise Exception("Stop here at dump generations")
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
